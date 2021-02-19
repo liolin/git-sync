@@ -3,8 +3,10 @@ extern crate log;
 
 use clap::{App, AppSettings, Arg, ArgMatches, SubCommand};
 use git2::{Config, ConfigLevel, Repository, Signature, Status, StatusEntry};
+use notify::{watcher, RecursiveMode, Watcher};
 use std::path::Path;
-use std::{thread, time};
+use std::sync::mpsc::channel;
+use std::time::Duration;
 use thiserror::Error;
 
 static PROG_NAME: &str = "git-sync";
@@ -117,52 +119,66 @@ fn run_timer(matches: &ArgMatches) -> ! {
     let dir = matches
         .value_of("directory")
         .expect("The cli parser should prevent reaching here");
-    let seconds = matches
-        .value_of("time")
-        .expect("The cli parser should prevent reaching here")
-        .parse()
-        .unwrap();
+    // let seconds = matches
+    //     .value_of("time")
+    //     .expect("The cli parser should prevent reaching here")
+    //     .parse()
+    //     .unwrap();
 
     let repo = Repository::open(dir).unwrap();
+    let (tx, rx) = channel();
+    let mut watcher = watcher(tx, Duration::from_millis(10)).unwrap();
+    watcher.watch(dir, RecursiveMode::Recursive).unwrap();
+
     loop {
-        let statuses = repo.statuses(None).unwrap();
-
-        if statuses.is_empty() {
-            let time_to_wait = time::Duration::from_secs(seconds);
-            thread::sleep(time_to_wait);
-            continue;
+        match rx.recv() {
+            Ok(_) => update(&repo),
+            Err(e) => println!("watch error: {:?}", e),
         }
-
-        for s in repo.statuses(None).unwrap().iter() {
-            match s.status() {
-                Status::WT_NEW | Status::WT_MODIFIED => adding_file(&repo, s),
-                Status::WT_DELETED => remove_file(&repo, s),
-                _ => panic!("unhandled git state: {:?}", s.status()),
-            }
-        }
-        create_commit(&repo, "my commit msg", false);
-        // TODO: Make a push to the remote
     }
 }
 
-fn adding_file(repo: &Repository, s: StatusEntry) {
+fn update(repo: &Repository) {
+    let statuses = repo.statuses(None).unwrap();
+    if statuses.is_empty() {
+        return;
+    }
+
+    let mut msg = String::from("Empty commit");
+
+    for s in repo.statuses(None).unwrap().iter() {
+        msg = match s.status() {
+            Status::WT_NEW | Status::WT_MODIFIED => adding_file(&repo, s),
+            Status::WT_DELETED => remove_file(&repo, s),
+            _ => panic!("unhandled git state: {:?}", s.status()),
+        }
+    }
+    create_commit(&repo, msg.as_str(), false);
+    // TODO: Make a push to the remote
+}
+
+fn adding_file(repo: &Repository, s: StatusEntry) -> String {
     let new_file = Path::new(s.path().unwrap());
     let mut index = repo.index().expect("cannot get the Index file");
-
-    info!("Add changes from {} to the repository", new_file.display());
+    let msg = format!("Add changes from {} to the repository", new_file.display());
+    info!("{}", msg);
 
     index.add_path(new_file).unwrap();
     index.write().unwrap();
+
+    msg
 }
 
-fn remove_file(repo: &Repository, s: StatusEntry) {
+fn remove_file(repo: &Repository, s: StatusEntry) -> String {
     let new_file = Path::new(s.path().unwrap());
     let mut index = repo.index().expect("cannot get the Index file");
-
-    info!("Remove {} from the repository", new_file.display());
+    let msg = format!("Remove {} from the repository", new_file.display());
+    info!("{}", msg);
 
     index.remove_path(Path::new(s.path().unwrap())).unwrap();
     index.write().unwrap();
+
+    msg
 }
 
 fn create_initial_commit(repo: &Repository) {
@@ -187,13 +203,20 @@ fn create_commit(repo: &Repository, msg: &str, initial: bool) {
     //     let commit = if initial { ... } else { ... };
     //     repo.commit(..., commit).unwrap();
     if initial {
-        repo.commit(Some(update_ref), &signature, &signature, msg, &tree, &[])
+        repo.commit(Some(update_ref), &signature, &signature, &msg, &tree, &[])
             .unwrap();
     } else {
         let commit = &[&repo
             .find_commit(repo.head().unwrap().target().unwrap())
             .unwrap()];
-        repo.commit(Some(update_ref), &signature, &signature, msg, &tree, commit)
-            .unwrap();
+        repo.commit(
+            Some(update_ref),
+            &signature,
+            &signature,
+            &msg,
+            &tree,
+            commit,
+        )
+        .unwrap();
     }
 }
