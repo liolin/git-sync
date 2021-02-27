@@ -2,11 +2,7 @@
 extern crate log;
 
 use clap::{App, AppSettings, Arg, ArgMatches, SubCommand};
-use git2::{AnnotatedCommit, Config};
-use git2::{
-    ConfigLevel, Cred, FetchOptions, PushOptions, RemoteCallbacks, Repository, Signature, Status,
-    StatusEntry,
-};
+use git2::{Config, ConfigLevel, Repository, Status, StatusEntry};
 use notify::{watcher, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::mpsc::channel;
@@ -119,14 +115,16 @@ fn run_setup(matches: &ArgMatches) -> Result<(), git2::Error> {
         .to_owned();
     let dir = Path::new(dir);
 
-    let repo = Repository::open(dir).or_else(|_| Repository::init(dir))?;
+    // TODO: Improve opening Repository (new or init or something diffrent?)
+    // TODO: Replace unwrap with proper error handling
+    let repo_information = RepoInformation::new(dir.to_str().unwrap(), "", "");
     let mut git_config = Config::new().unwrap();
     let git_config_file = dir.join(".git").join("config");
     git_config.add_file(&git_config_file, ConfigLevel::Local, false)?;
     git_config.set_str("user.name", &author).unwrap();
     git_config.set_str("user.email", &email).unwrap();
 
-    create_initial_commit(&repo);
+    repo_information.commit("Initial commit")?;
     Ok(())
 }
 
@@ -147,7 +145,6 @@ fn run_timer(matches: &ArgMatches) -> ! {
     //     .unwrap();
 
     let repo_information = RepoInformation::new(dir, remote, branch);
-    let repository = Repository::open(repo_information.path()).unwrap();
     let commit = repo_information.fetch().unwrap();
     repo_information.merge(commit).unwrap();
 
@@ -157,152 +154,53 @@ fn run_timer(matches: &ArgMatches) -> ! {
 
     loop {
         match rx.recv() {
-            Ok(_) => update(&repository),
+            // TODO: Replace unwrap with proper error handeling
+            Ok(_) => update(&repo_information).unwrap(),
             Err(e) => println!("watch error: {:?}", e),
         }
     }
 }
 
-fn update(repo: &Repository) {
-    let statuses = repo.statuses(None).unwrap();
+fn update(repo_information: &RepoInformation) -> Result<(), git2::Error> {
+    let statuses = repo_information.git_repo().statuses(None)?;
     if statuses.is_empty() {
-        return;
+        return Ok(());
     }
 
-    let mut msg = String::from("Empty commit");
-
-    for s in repo.statuses(None).unwrap().iter() {
+    let mut msg = String::new();
+    for s in repo_information.git_repo().statuses(None).unwrap().iter() {
         msg = match s.status() {
-            Status::WT_NEW | Status::WT_MODIFIED => adding_file(&repo, s),
-            Status::WT_DELETED => remove_file(&repo, s),
+            Status::WT_NEW | Status::WT_MODIFIED => adding_file(repo_information.git_repo(), s)?,
+            Status::WT_DELETED => remove_file(repo_information.git_repo(), s)?,
             _ => panic!("unhandled git state: {:?}", s.status()),
         }
     }
-    create_commit(&repo, msg.as_str(), false);
-    // TODO: Make a push to the remote
-    perform_push(&repo);
+
+    repo_information.commit(msg.as_str())?;
+    repo_information.push()?;
+    Ok(())
 }
 
-fn adding_file(repo: &Repository, s: StatusEntry) -> String {
+fn adding_file(repo: &Repository, s: StatusEntry) -> Result<String, git2::Error> {
+    // TODO: Replace unwrap
     let new_file = Path::new(s.path().unwrap());
-    let mut index = repo.index().expect("cannot get the Index file");
+    let mut index = repo.index()?;
     let msg = format!("Add changes from {} to the repository", new_file.display());
     info!("{}", msg);
 
-    index.add_path(new_file).unwrap();
-    index.write().unwrap();
-
-    msg
+    index.add_path(new_file)?;
+    index.write()?;
+    Ok(msg)
 }
 
-fn remove_file(repo: &Repository, s: StatusEntry) -> String {
+fn remove_file(repo: &Repository, s: StatusEntry) -> Result<String, git2::Error> {
+    // TODO: Replace unwrap
     let new_file = Path::new(s.path().unwrap());
-    let mut index = repo.index().expect("cannot get the Index file");
+    let mut index = repo.index()?;
     let msg = format!("Remove {} from the repository", new_file.display());
     info!("{}", msg);
 
-    index.remove_path(Path::new(s.path().unwrap())).unwrap();
-    index.write().unwrap();
-
-    msg
-}
-
-fn create_initial_commit(repo: &Repository) {
-    create_commit(repo, "Initial commit", true);
-}
-
-fn create_commit(repo: &Repository, msg: &str, initial: bool) {
-    let config = repo.config().unwrap().snapshot().unwrap();
-    let author = config.get_str("user.name").unwrap();
-    let email = config.get_str("user.email").unwrap();
-
-    let update_ref = "HEAD";
-    let signature = Signature::now(author, email).unwrap();
-    let mut index = repo.index().expect("cannot get the index file");
-    let tree_oid = index.write_tree().unwrap();
-    let tree = repo.find_tree(tree_oid).unwrap();
-
-    info!("New commit: {}, {}, {}", update_ref, &signature, msg);
-
-    // TODO: Does not exist a better way?
-    // e.g:
-    //     let commit = if initial { ... } else { ... };
-    //     repo.commit(..., commit).unwrap();
-    if initial {
-        repo.commit(Some(update_ref), &signature, &signature, &msg, &tree, &[])
-            .unwrap();
-    } else {
-        let commit = &[&repo
-            .find_commit(repo.head().unwrap().target().unwrap())
-            .unwrap()];
-        repo.commit(
-            Some(update_ref),
-            &signature,
-            &signature,
-            &msg,
-            &tree,
-            commit,
-        )
-        .unwrap();
-    }
-}
-
-fn perform_push(repo: &Repository) {
-    info!("Perform push request");
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(|_url, username_from_url, _allowed_types| {
-        Cred::ssh_key_from_agent(username_from_url.unwrap())
-    });
-    let mut push_options = PushOptions::new();
-    push_options.remote_callbacks(callbacks);
-
-    let remotes = repo.remotes().unwrap();
-    let mut remote = repo.find_remote(remotes.get(0).unwrap()).unwrap();
-    remote
-        .push(
-            &["refs/heads/master:refs/heads/master"],
-            Some(&mut push_options),
-        )
-        .unwrap();
-}
-
-fn perform_fetch<'a>(
-    repo: &'a Repository,
-    remote: &mut git2::Remote,
-    refs: &[&str],
-) -> Result<AnnotatedCommit<'a>, git2::Error> {
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(|_url, username_from_url, _allowed_types| {
-        info!("Ask agent for SSH key");
-        Cred::ssh_key_from_agent(username_from_url.unwrap())
-    });
-
-    let mut fetch_options = FetchOptions::new();
-    fetch_options.remote_callbacks(callbacks);
-    //fetch_options.download_tags(git2::AutotagOption::All);
-    info!(
-        "Fetching {}/{} for repo",
-        remote.name().unwrap(),
-        refs.get(0).unwrap()
-    );
-    remote.fetch(refs, Some(&mut fetch_options), None)?;
-
-    let fetch_head = repo.find_reference("FETCH_HEAD")?;
-    let commit = repo.reference_to_annotated_commit(&fetch_head)?;
-    Ok(commit)
-}
-
-fn perfrom_merge(
-    repo: &Repository,
-    branch: &str,
-    commit: AnnotatedCommit,
-) -> Result<(), git2::Error> {
-    // to fast forward
-    let refname = format!("refs/heads/{}", branch);
-    let mut refe = repo.find_reference(&refname)?;
-
-    refe.set_target(commit.id(), "Fast-Forward")?;
-    repo.set_head(refe.name().unwrap())?;
-    repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
-    Ok(())
+    index.remove_path(Path::new(s.path().unwrap()))?;
+    index.write()?;
+    Ok(msg)
 }
