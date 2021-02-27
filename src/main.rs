@@ -2,23 +2,17 @@
 extern crate log;
 
 use clap::{App, AppSettings, Arg, ArgMatches, SubCommand};
-use git2::{Config, ConfigLevel, Repository, Signature, Status, StatusEntry};
+use git2::{Config, MergeOptions, Reference};
+use git2::{
+    ConfigLevel, Cred, FetchOptions, PushOptions, RemoteCallbacks, Repository, Signature, Status,
+    StatusEntry,
+};
 use notify::{watcher, RecursiveMode, Watcher};
-use std::path::Path;
 use std::sync::mpsc::channel;
 use std::time::Duration;
-use thiserror::Error;
+use std::{io::Write, path::Path};
 
 static PROG_NAME: &str = "git-sync";
-
-#[derive(Error, Debug)]
-enum GitSyncError {
-    #[error("Can not open the repository")]
-    OpenRepository {
-        #[from]
-        source: git2::Error,
-    },
-}
 
 fn main() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -89,7 +83,7 @@ fn main() {
     }
 }
 
-fn run_setup(matches: &ArgMatches) -> Result<(), GitSyncError> {
+fn run_setup(matches: &ArgMatches) -> Result<(), git2::Error> {
     let dir = matches
         .value_of("directory")
         .expect("The cli parser should prevent reaching here");
@@ -126,6 +120,8 @@ fn run_timer(matches: &ArgMatches) -> ! {
     //     .unwrap();
 
     let repo = Repository::open(dir).unwrap();
+    perform_pull(&repo);
+
     let (tx, rx) = channel();
     let mut watcher = watcher(tx, Duration::from_millis(10)).unwrap();
     watcher.watch(dir, RecursiveMode::Recursive).unwrap();
@@ -155,6 +151,7 @@ fn update(repo: &Repository) {
     }
     create_commit(&repo, msg.as_str(), false);
     // TODO: Make a push to the remote
+    perform_push(&repo);
 }
 
 fn adding_file(repo: &Repository, s: StatusEntry) -> String {
@@ -219,4 +216,77 @@ fn create_commit(repo: &Repository, msg: &str, initial: bool) {
         )
         .unwrap();
     }
+}
+
+fn perform_push(repo: &Repository) {
+    info!("Perform push request");
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(|_url, username_from_url, _allowed_types| {
+        Cred::ssh_key_from_agent(username_from_url.unwrap())
+    });
+    let mut push_options = PushOptions::new();
+    push_options.remote_callbacks(callbacks);
+
+    let remotes = repo.remotes().unwrap();
+    let mut remote = repo.find_remote(remotes.get(0).unwrap()).unwrap();
+    remote
+        .push(
+            &["refs/heads/master:refs/heads/master"],
+            Some(&mut push_options),
+        )
+        .unwrap();
+}
+
+fn perform_pull(repo: &Repository) {
+    info!("Perform pull request");
+    //preperation
+    let remotes = repo.remotes().unwrap();
+    let mut remote = repo.find_remote(remotes.get(0).unwrap()).unwrap();
+    let refs = &["master"];
+
+    // do fetch
+    let mut cb = git2::RemoteCallbacks::new();
+    // Print out our transfer progress.
+    cb.transfer_progress(|stats| {
+        if stats.received_objects() == stats.total_objects() {
+            print!(
+                "Resolving deltas {}/{}\r",
+                stats.indexed_deltas(),
+                stats.total_deltas()
+            );
+        } else if stats.total_objects() > 0 {
+            print!(
+                "Received {}/{} objects ({}) in {} bytes\r",
+                stats.received_objects(),
+                stats.total_objects(),
+                stats.indexed_objects(),
+                stats.received_bytes()
+            );
+        }
+        std::io::stdout().flush().unwrap();
+        true
+    });
+    cb.credentials(|_url, username_from_url, _allowed_types| {
+        Cred::ssh_key_from_agent(username_from_url.unwrap())
+    });
+
+    let mut fo = git2::FetchOptions::new();
+    fo.remote_callbacks(cb);
+    // Always fetch all tags.
+    // Perform a download and also update tips
+    fo.download_tags(git2::AutotagOption::All);
+    println!("Fetching {} for repo", remote.name().unwrap());
+    remote.fetch(refs, Some(&mut fo), None).unwrap();
+
+    let fetch_head = repo.find_reference("FETCH_HEAD").unwrap();
+    let commit = repo.reference_to_annotated_commit(&fetch_head).unwrap();
+
+    // to fast forward
+    let refname = format!("refs/heads/{}", "master");
+    let mut refe = repo.find_reference(&refname).unwrap();
+
+    refe.set_target(commit.id(), "Fast-Forward").unwrap();
+    repo.set_head(refe.name().unwrap()).unwrap();
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
+        .unwrap();
 }
