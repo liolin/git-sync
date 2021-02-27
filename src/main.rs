@@ -2,17 +2,20 @@
 extern crate log;
 
 use clap::{App, AppSettings, Arg, ArgMatches, SubCommand};
-use git2::{Config, MergeOptions, Reference};
+use git2::{AnnotatedCommit, Config};
 use git2::{
     ConfigLevel, Cred, FetchOptions, PushOptions, RemoteCallbacks, Repository, Signature, Status,
     StatusEntry,
 };
 use notify::{watcher, RecursiveMode, Watcher};
+use std::path::Path;
 use std::sync::mpsc::channel;
 use std::time::Duration;
-use std::{io::Write, path::Path};
 
 static PROG_NAME: &str = "git-sync";
+
+mod repository;
+use repository::RepoInformation;
 
 fn main() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -72,6 +75,24 @@ fn main() {
                         .takes_value(true)
                         .required(true)
                         .value_name("TIME"),
+                )
+                .arg(
+                    Arg::with_name("branch")
+                        .short("b")
+                        .long("branch")
+                        .help("The name of the branch, for example \"master\"")
+                        .takes_value(true)
+                        .required(true)
+                        .value_name("BRANCH"),
+                )
+                .arg(
+                    Arg::with_name("remote")
+                        .short("r")
+                        .long("remote")
+                        .help("The name of the remote, for example \"origin\"")
+                        .takes_value(true)
+                        .required(true)
+                        .value_name("REMOTE"),
                 ),
         )
         .get_matches();
@@ -113,14 +134,22 @@ fn run_timer(matches: &ArgMatches) -> ! {
     let dir = matches
         .value_of("directory")
         .expect("The cli parser should prevent reaching here");
+    let remote = matches
+        .value_of("remote")
+        .expect("The cli parser should prevent reaching here");
+    let branch = matches
+        .value_of("branch")
+        .expect("The cli parser should prevent reaching here");
     // let seconds = matches
     //     .value_of("time")
     //     .expect("The cli parser should prevent reaching here")
     //     .parse()
     //     .unwrap();
 
-    let repo = Repository::open(dir).unwrap();
-    perform_pull(&repo);
+    let repo_information = RepoInformation::new(dir, remote, branch);
+    let repository = Repository::open(repo_information.path()).unwrap();
+    let commit = repo_information.fetch().unwrap();
+    repo_information.merge(commit).unwrap();
 
     let (tx, rx) = channel();
     let mut watcher = watcher(tx, Duration::from_millis(10)).unwrap();
@@ -128,7 +157,7 @@ fn run_timer(matches: &ArgMatches) -> ! {
 
     loop {
         match rx.recv() {
-            Ok(_) => update(&repo),
+            Ok(_) => update(&repository),
             Err(e) => println!("watch error: {:?}", e),
         }
     }
@@ -237,56 +266,43 @@ fn perform_push(repo: &Repository) {
         .unwrap();
 }
 
-fn perform_pull(repo: &Repository) {
-    info!("Perform pull request");
-    //preperation
-    let remotes = repo.remotes().unwrap();
-    let mut remote = repo.find_remote(remotes.get(0).unwrap()).unwrap();
-    let refs = &["master"];
-
-    // do fetch
-    let mut cb = git2::RemoteCallbacks::new();
-    // Print out our transfer progress.
-    cb.transfer_progress(|stats| {
-        if stats.received_objects() == stats.total_objects() {
-            print!(
-                "Resolving deltas {}/{}\r",
-                stats.indexed_deltas(),
-                stats.total_deltas()
-            );
-        } else if stats.total_objects() > 0 {
-            print!(
-                "Received {}/{} objects ({}) in {} bytes\r",
-                stats.received_objects(),
-                stats.total_objects(),
-                stats.indexed_objects(),
-                stats.received_bytes()
-            );
-        }
-        std::io::stdout().flush().unwrap();
-        true
-    });
-    cb.credentials(|_url, username_from_url, _allowed_types| {
+fn perform_fetch<'a>(
+    repo: &'a Repository,
+    remote: &mut git2::Remote,
+    refs: &[&str],
+) -> Result<AnnotatedCommit<'a>, git2::Error> {
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(|_url, username_from_url, _allowed_types| {
+        info!("Ask agent for SSH key");
         Cred::ssh_key_from_agent(username_from_url.unwrap())
     });
 
-    let mut fo = git2::FetchOptions::new();
-    fo.remote_callbacks(cb);
-    // Always fetch all tags.
-    // Perform a download and also update tips
-    fo.download_tags(git2::AutotagOption::All);
-    println!("Fetching {} for repo", remote.name().unwrap());
-    remote.fetch(refs, Some(&mut fo), None).unwrap();
+    let mut fetch_options = FetchOptions::new();
+    fetch_options.remote_callbacks(callbacks);
+    //fetch_options.download_tags(git2::AutotagOption::All);
+    info!(
+        "Fetching {}/{} for repo",
+        remote.name().unwrap(),
+        refs.get(0).unwrap()
+    );
+    remote.fetch(refs, Some(&mut fetch_options), None)?;
 
-    let fetch_head = repo.find_reference("FETCH_HEAD").unwrap();
-    let commit = repo.reference_to_annotated_commit(&fetch_head).unwrap();
+    let fetch_head = repo.find_reference("FETCH_HEAD")?;
+    let commit = repo.reference_to_annotated_commit(&fetch_head)?;
+    Ok(commit)
+}
 
+fn perfrom_merge(
+    repo: &Repository,
+    branch: &str,
+    commit: AnnotatedCommit,
+) -> Result<(), git2::Error> {
     // to fast forward
-    let refname = format!("refs/heads/{}", "master");
-    let mut refe = repo.find_reference(&refname).unwrap();
+    let refname = format!("refs/heads/{}", branch);
+    let mut refe = repo.find_reference(&refname)?;
 
-    refe.set_target(commit.id(), "Fast-Forward").unwrap();
-    repo.set_head(refe.name().unwrap()).unwrap();
-    repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
-        .unwrap();
+    refe.set_target(commit.id(), "Fast-Forward")?;
+    repo.set_head(refe.name().unwrap())?;
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+    Ok(())
 }
