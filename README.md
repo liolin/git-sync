@@ -10,3 +10,4 @@ Sync my org-files over a git repository automatically (Not finished yet.)
 - [ ] Better merge handling (Not just FastForward)
 - [ ] Replace all the unwraps
 - [ ] Fix all the TODOs
+- [ ] Implement tests
