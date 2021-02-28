@@ -13,6 +13,18 @@ static PROG_NAME: &str = "git-sync";
 mod repository;
 use repository::RepoInformation;
 
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum GitSyncError {
+    #[error("git2 error occured")]
+    Git2(#[from] git2::Error),
+    #[error("An IO error ouccred")]
+    Io(#[from] std::io::Error),
+    #[error("unknown data store error")]
+    Unknown,
+}
+
 fn main() {
     let _ = env_logger::builder().is_test(true).try_init();
     let matches = App::new(PROG_NAME)
@@ -52,8 +64,8 @@ fn main() {
                 ),
         )
         .subcommand(
-            SubCommand::with_name("timer")
-                .about("Looks for changes in the repository all x minutes")
+            SubCommand::with_name("watch")
+                .about("Looks for changes in the repository")
                 .arg(
                     Arg::with_name("directory")
                         .short("d")
@@ -62,15 +74,6 @@ fn main() {
                         .help("Sets the git repository")
                         .takes_value(true)
                         .required(true),
-                )
-                .arg(
-                    Arg::with_name("time")
-                        .short("t")
-                        .long("time")
-                        .help("How often in seconds the repo should be check for changes")
-                        .takes_value(true)
-                        .required(true)
-                        .value_name("TIME"),
                 )
                 .arg(
                     Arg::with_name("branch")
@@ -100,7 +103,7 @@ fn main() {
     }
 }
 
-fn run_setup(matches: &ArgMatches) -> Result<(), git2::Error> {
+fn run_setup(matches: &ArgMatches) -> Result<(), GitSyncError> {
     let dir = matches
         .value_of("directory")
         .expect("The cli parser should prevent reaching here");
@@ -115,10 +118,22 @@ fn run_setup(matches: &ArgMatches) -> Result<(), git2::Error> {
         .to_owned();
     let dir = Path::new(dir);
 
-    // TODO: Improve opening Repository (new or init or something diffrent?)
-    // TODO: Replace unwrap with proper error handling
-    let repo_information = RepoInformation::new(dir.to_str().unwrap(), "", "");
-    let mut git_config = Config::new().unwrap();
+    let path = dir.to_str().ok_or(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "Path is not valid UTF-8",
+    ))?;
+
+    if !dir.exists() {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    let repo_information = if RepoInformation::is_repo(path) {
+        RepoInformation::new(path, "", "")
+    } else {
+        RepoInformation::init(path, "", "")
+    };
+
+    let mut git_config = Config::new()?;
     let git_config_file = dir.join(".git").join("config");
     git_config.add_file(&git_config_file, ConfigLevel::Local, false)?;
     git_config.set_str("user.name", &author).unwrap();
@@ -128,7 +143,7 @@ fn run_setup(matches: &ArgMatches) -> Result<(), git2::Error> {
     Ok(())
 }
 
-fn run_timer(matches: &ArgMatches) -> ! {
+fn run_timer(matches: &ArgMatches) {
     let dir = matches
         .value_of("directory")
         .expect("The cli parser should prevent reaching here");
@@ -138,15 +153,8 @@ fn run_timer(matches: &ArgMatches) -> ! {
     let branch = matches
         .value_of("branch")
         .expect("The cli parser should prevent reaching here");
-    // let seconds = matches
-    //     .value_of("time")
-    //     .expect("The cli parser should prevent reaching here")
-    //     .parse()
-    //     .unwrap();
 
     let repo_information = RepoInformation::new(dir, remote, branch);
-    let commit = repo_information.fetch().unwrap();
-    repo_information.merge(commit).unwrap();
 
     let (tx, rx) = channel();
     let mut watcher = watcher(tx, Duration::from_millis(10)).unwrap();
@@ -156,19 +164,25 @@ fn run_timer(matches: &ArgMatches) -> ! {
         match rx.recv() {
             // TODO: Replace unwrap with proper error handeling
             Ok(_) => update(&repo_information).unwrap(),
-            Err(e) => println!("watch error: {:?}", e),
+            Err(e) => {
+                debug!("Config watcher channel dropped unexpectedly: {}", e);
+                break;
+            }
         }
     }
 }
 
-fn update(repo_information: &RepoInformation) -> Result<(), git2::Error> {
+fn update(repo_information: &RepoInformation) -> Result<(), GitSyncError> {
     let statuses = repo_information.git_repo().statuses(None)?;
     if statuses.is_empty() {
         return Ok(());
     }
 
+    let commit = repo_information.fetch()?;
+    repo_information.merge(commit)?;
+
     let mut msg = String::new();
-    for s in repo_information.git_repo().statuses(None).unwrap().iter() {
+    for s in repo_information.git_repo().statuses(None)?.iter() {
         msg = match s.status() {
             Status::WT_NEW | Status::WT_MODIFIED => adding_file(repo_information.git_repo(), s)?,
             Status::WT_DELETED => remove_file(repo_information.git_repo(), s)?,
@@ -181,9 +195,12 @@ fn update(repo_information: &RepoInformation) -> Result<(), git2::Error> {
     Ok(())
 }
 
-fn adding_file(repo: &Repository, s: StatusEntry) -> Result<String, git2::Error> {
-    // TODO: Replace unwrap
-    let new_file = Path::new(s.path().unwrap());
+fn adding_file(repo: &Repository, s: StatusEntry) -> Result<String, GitSyncError> {
+    let path = s.path().ok_or(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "Path is not valid UTF-8",
+    ))?;
+    let new_file = Path::new(path);
     let mut index = repo.index()?;
     let msg = format!("Add changes from {} to the repository", new_file.display());
     info!("{}", msg);
@@ -193,14 +210,17 @@ fn adding_file(repo: &Repository, s: StatusEntry) -> Result<String, git2::Error>
     Ok(msg)
 }
 
-fn remove_file(repo: &Repository, s: StatusEntry) -> Result<String, git2::Error> {
-    // TODO: Replace unwrap
-    let new_file = Path::new(s.path().unwrap());
+fn remove_file(repo: &Repository, s: StatusEntry) -> Result<String, GitSyncError> {
+    let path = s.path().ok_or(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "Path is not valid UTF-8",
+    ))?;
+    let new_file = Path::new(path);
     let mut index = repo.index()?;
     let msg = format!("Remove {} from the repository", new_file.display());
     info!("{}", msg);
 
-    index.remove_path(Path::new(s.path().unwrap()))?;
+    index.remove_path(Path::new(path))?;
     index.write()?;
     Ok(msg)
 }

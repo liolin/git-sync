@@ -29,6 +29,10 @@ impl<'a> RepoInformation<'a> {
         }
     }
 
+    pub fn is_repo(path: &str) -> bool {
+        git2::Repository::open(path).is_ok()
+    }
+
     pub fn path(&self) -> &'a str {
         self.path
     }
