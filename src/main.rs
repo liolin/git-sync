@@ -98,7 +98,7 @@ fn main() {
 
     match matches.subcommand() {
         ("setup", Some(matches)) => run_setup(matches).unwrap(),
-        ("timer", Some(matches)) => run_timer(matches),
+        ("watch", Some(matches)) => run_watch(matches),
         _ => unreachable!("The cli parser should prevent reaching here"),
     }
 }
@@ -143,7 +143,7 @@ fn run_setup(matches: &ArgMatches) -> Result<(), GitSyncError> {
     Ok(())
 }
 
-fn run_timer(matches: &ArgMatches) {
+fn run_watch(matches: &ArgMatches) {
     let dir = matches
         .value_of("directory")
         .expect("The cli parser should prevent reaching here");
@@ -159,6 +159,10 @@ fn run_timer(matches: &ArgMatches) {
     let (tx, rx) = channel();
     let mut watcher = watcher(tx, Duration::from_millis(10)).unwrap();
     watcher.watch(dir, RecursiveMode::Recursive).unwrap();
+
+    // TODO: Replace unwrap (Change Return type of function)
+    let commit = repo_information.fetch().unwrap();
+    repo_information.merge(commit).unwrap();
 
     loop {
         match rx.recv() {

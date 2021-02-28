@@ -110,17 +110,24 @@ impl<'a> RepoInformation<'a> {
         Ok(commit)
     }
 
-    pub fn merge(&self, commit: git2::AnnotatedCommit) -> GitResult<()> {
+    pub fn merge(&self, remote: git2::AnnotatedCommit) -> GitResult<()> {
         info!("Let's do a merge");
-        let analysis = self.git_repo.merge_analysis(&[&commit])?;
+        let analysis = self.git_repo.merge_analysis(&[&remote])?;
 
         if analysis.0.is_fast_forward() {
             info!("Merging with Fastforward");
-            self.do_fast_forward(commit).unwrap()
+            self.do_fast_forward(remote)?;
         } else if analysis.0.is_normal() {
             info!("Do a normal merge");
-            unimplemented!("Is not implemented yet");
-            //self.do_fast_forward(commit).unwrap()
+            // search the local commit
+            // TODO: Better git2 error
+            let local_oid = self.git_repo().head()?.target().ok_or(git2::Error::new(
+                git2::ErrorCode::NotFound,
+                git2::ErrorClass::Object,
+                "Some git2 error occured",
+            ))?;
+            let local = self.git_repo().find_annotated_commit(local_oid)?;
+            self.do_normal_merge(remote, local)?;
         } else {
             info!("There is nothing to do");
         }
@@ -156,6 +163,49 @@ impl<'a> RepoInformation<'a> {
         self.git_repo.set_head(refe.name().unwrap())?;
         self.git_repo
             .checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+        Ok(())
+    }
+
+    fn do_normal_merge(
+        &self,
+        local: git2::AnnotatedCommit,
+        remote: git2::AnnotatedCommit,
+    ) -> Result<(), git2::Error> {
+        unimplemented!();
+        let local_tree = self.git_repo().find_commit(local.id())?.tree()?;
+        let remote_tree = self.git_repo().find_commit(remote.id())?.tree()?;
+        let ancestor = self
+            .git_repo()
+            .find_commit(self.git_repo().merge_base(local.id(), remote.id())?)?
+            .tree()?;
+        let mut idx = self
+            .git_repo()
+            .merge_trees(&ancestor, &local_tree, &remote_tree, None)?;
+
+        if idx.has_conflicts() {
+            info!("Merge conficts detected...");
+            self.git_repo().checkout_index(Some(&mut idx), None)?;
+            return Ok(());
+        }
+        let result_tree = self
+            .git_repo()
+            .find_tree(idx.write_tree_to(self.git_repo())?)?;
+        // now create the merge commit
+        let msg = format!("Merge: {} into {}", remote.id(), local.id());
+        let sig = self.git_repo().signature()?;
+        let local_commit = self.git_repo().find_commit(local.id())?;
+        let remote_commit = self.git_repo().find_commit(remote.id())?;
+        // Do our merge commit and set current branch head to that commit.
+        let _merge_commit = self.git_repo().commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            &msg,
+            &result_tree,
+            &[&local_commit, &remote_commit],
+        )?;
+        // Set working tree to match head.
+        self.git_repo().checkout_head(None)?;
         Ok(())
     }
 
